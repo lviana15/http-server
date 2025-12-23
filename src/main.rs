@@ -14,7 +14,7 @@ fn main() -> std::io::Result<()> {
     let port = env::var("PORT").expect("Missing PORT");
     let url = format!("127.0.0.1:{}", port);
 
-    let pool = ThreadPool::new(4);
+    let pool = ThreadPool::new(4).expect("Failed to create pool");
 
     if let Ok(listener) = TcpListener::bind(&url) {
         println!("Successfully bind to {}", url);
