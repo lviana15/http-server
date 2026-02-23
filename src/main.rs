@@ -69,6 +69,9 @@ fn parse_request(request: &str) -> Result<HttpRequest, ParseError> {
 }
 
 const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+const TOO_LARGE: &[u8] = b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n";
+const MAX_HEADERS_SIZE: usize = 8 * 1024;       // 8 KB
+const MAX_BODY_SIZE: usize = 1 * 1024 * 1024;  // 1 MB
 
 fn handle_connection(mut stream: TcpStream) {
     if try_handle(&stream).is_err() {
@@ -86,6 +89,10 @@ fn try_handle(mut stream: &TcpStream) -> Result<(), Box<dyn std::error::Error>> 
         if line == "\r\n" || line.is_empty() {
             break;
         }
+        if raw_headers.len() + line.len() > MAX_HEADERS_SIZE {
+            stream.write_all(TOO_LARGE)?;
+            return Ok(());
+        }
         raw_headers.push_str(&line);
     }
 
@@ -100,6 +107,11 @@ fn try_handle(mut stream: &TcpStream) -> Result<(), Box<dyn std::error::Error>> 
                 .flatten()
         })
         .unwrap_or(0);
+
+    if content_length > MAX_BODY_SIZE {
+        stream.write_all(TOO_LARGE)?;
+        return Ok(());
+    }
 
     let mut body_bytes = vec![0u8; content_length];
     reader.read_exact(&mut body_bytes)?;
