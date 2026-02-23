@@ -1,9 +1,11 @@
+#[cfg(test)]
+mod tests;
 pub mod thread_pool;
 
 use dotenv::dotenv;
 use std::collections::HashMap;
 use std::env;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use crate::thread_pool::ThreadPool;
@@ -16,105 +18,106 @@ struct HttpRequest {
     body: Option<String>,
 }
 
+#[derive(Debug)]
 enum ParseError {
     InvalidRequestLine,
     InvalidHeader,
     IncompleteRequest,
-    UnsupportedMethod,
 }
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRequestLine => write!(f, "invalid request line"),
+            Self::InvalidHeader => write!(f, "invalid header"),
+            Self::IncompleteRequest => write!(f, "incomplete request"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 fn parse_request(request: &str) -> Result<HttpRequest, ParseError> {
     let mut lines = request.lines();
 
     let request_line = lines.next().ok_or(ParseError::IncompleteRequest)?;
-    let (method, path, version) = {
-        let mut parts = request_line.split_whitespace();
-        let method = parts
-            .next()
-            .ok_or(ParseError::InvalidRequestLine)?
-            .to_string();
-        let path = parts
-            .next()
-            .ok_or(ParseError::InvalidRequestLine)?
-            .to_string();
-        let version = parts
-            .next()
-            .ok_or(ParseError::InvalidRequestLine)?
-            .to_string();
-        (method, path, version)
-    };
+
+    let (method, rest) = request_line
+        .split_once(' ')
+        .ok_or(ParseError::InvalidRequestLine)?;
+    let (path, version) = rest.split_once(' ').ok_or(ParseError::InvalidRequestLine)?;
 
     let headers = lines
         .by_ref()
         .take_while(|line| !line.is_empty())
         .map(|line| {
-            let mut header_parts = line.splitn(2, ':');
-            let key = header_parts
-                .next()
-                .ok_or(ParseError::InvalidHeader)?
-                .trim()
-                .to_string();
-            let value = header_parts
-                .next()
-                .ok_or(ParseError::InvalidHeader)?
-                .trim()
-                .to_string();
-            Ok((key, value))
+            let (key, value) = line.split_once(':').ok_or(ParseError::InvalidHeader)?;
+            Ok((key.trim().to_string(), value.trim().to_string()))
         })
         .collect::<Result<HashMap<_, _>, _>>()?;
 
-    let body = {
-        let body = lines.collect::<Vec<&str>>().join("\n");
-        (!body.is_empty()).then_some(body)
-    };
+    let body = lines.collect::<Vec<_>>().join("\n");
+    let body = (!body.is_empty()).then_some(body);
 
     Ok(HttpRequest {
-        method,
-        path,
-        version,
+        method: method.to_string(),
+        path: path.to_string(),
+        version: version.to_string(),
         headers,
         body,
     })
 }
 
+const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+
 fn handle_connection(mut stream: TcpStream) {
-    let mut buffer = Vec::new();
-    let mut temp_buffer = [0; 1024];
+    if try_handle(&stream).is_err() {
+        let _ = stream.write_all(BAD_REQUEST);
+    }
+}
 
-    let result = loop {
-        match stream.read(&mut temp_buffer) {
-            Ok(0) => break Err(ParseError::IncompleteRequest),
-            Ok(n) => buffer.extend_from_slice(&temp_buffer[..n]),
-            Err(_) => break Err(ParseError::IncompleteRequest),
+fn try_handle(mut stream: &TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    let mut reader = BufReader::new(stream);
+
+    let mut raw_headers = String::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        if line == "\r\n" || line.is_empty() {
+            break;
         }
-
-        if buffer.windows(4).any(|w| w == b"\r\n\r\n") {
-            break Ok(());
-        }
-    };
-
-    if let Err(_) = result {
-        let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-        let _ = stream.write_all(response.as_bytes());
-        return;
+        raw_headers.push_str(&line);
     }
 
-    let request_str = String::from_utf8_lossy(&buffer);
-    match parse_request(&request_str) {
-        Ok(request) => {
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\nMethod: {}, Path: {}",
-                request.method.len() + request.path.len() + 10,
-                request.method,
-                request.path
-            );
-            let _ = stream.write_all(response.as_bytes());
-        }
-        Err(_) => {
-            let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-            let _ = stream.write_all(response.as_bytes());
-        }
-    }
+    let content_length: usize = raw_headers
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+
+    let mut body_bytes = vec![0u8; content_length];
+    reader.read_exact(&mut body_bytes)?;
+    let body_str = String::from_utf8(body_bytes)?;
+
+    let full_request = format!("{}\r\n\r\n{}", raw_headers.trim_end(), body_str);
+
+    let request = parse_request(&full_request)?;
+
+    let body = format!("Method: {}, Path: {}", request.method, request.path);
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes())?;
+
+    Ok(())
 }
 
 fn main() -> std::io::Result<()> {
@@ -125,17 +128,12 @@ fn main() -> std::io::Result<()> {
 
     let pool = ThreadPool::new(4).expect("Failed to create pool");
 
-    if let Ok(listener) = TcpListener::bind(&url) {
-        println!("Successfully bind to {}", url);
-        println!("Waiting for connections...");
+    let listener = TcpListener::bind(&url)?;
+    println!("Listening on {}", url);
 
-        for request in listener.incoming() {
-            let req = request.unwrap();
-
-            pool.execute(move || handle_connection(req))
-        }
-    } else {
-        println!("Failed to bind to port {}", port);
+    for stream in listener.incoming() {
+        let stream = stream?;
+        pool.execute(move || handle_connection(stream));
     }
 
     Ok(())
