@@ -96,3 +96,41 @@ impl Worker {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn test_thread_pool_creation() {
+        let pool = ThreadPool::new(4);
+        assert!(pool.is_ok());
+        let pool = pool.unwrap();
+        assert_eq!(pool.workers.len(), 4);
+    }
+
+    #[test]
+    fn test_thread_pool_invalid_size() {
+        let pool = ThreadPool::new(0);
+        assert!(matches!(pool, Err(PoolCreationError::InvalidSize)));
+    }
+
+    #[test]
+    fn test_thread_pool_execution() {
+        let pool = ThreadPool::new(2).unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..5 {
+            let counter_clone = Arc::clone(&counter);
+            pool.execute(move || {
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        // Give workers time to finish
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(counter.load(Ordering::SeqCst), 5);
+    }
+}
